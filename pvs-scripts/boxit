@@ -45,8 +45,10 @@ DESCRIPTION
                          then proveit proves the development. Every formula
                          must be "proved - complete".
        .containerignore  local PVS files that the container must not copy
-       README.md         the build and run commands (only if <dir> has no
-                         README.md)
+       README.md         the commands to build and run the container, and
+                         the steps of a check with a local PVS and NASALib,
+                         with the PVS and NASALib commits that the
+                         container uses (only if <dir> has no README.md)
      If <dir> has a file Containerfile or check-proofs.sh, the zip contains
      the generated file, not the file of <dir>. The zip does not contain
      the files <type>_adt.pvs and <type>_codt.pvs, because PVS generates
@@ -754,13 +756,124 @@ EOF
 
 printf 'orphaned-proofs.prf\npvsbin\n.pvscontext\n' > "$stage/.containerignore"
 
+# The section of the README on a local check. It gives the versions that the
+# container uses, the steps of a local check, and the result of step 2.
+pvs_version=${pvs_release#pvs}
+# For an annotated tag, the line that ends with ^{} gives the commit.
+pvs_commit=$(git ls-remote https://github.com/SRI-CSL/PVS \
+               "refs/tags/$pvs_release^{}" "refs/tags/$pvs_release" 2>/dev/null \
+             | awk '$2 ~ /\^\{\}$/ { c = $1 } NR == 1 { f = $1 }
+                    END { if (c != "") print c; else if (f != "") print f }' || true)
+if [ -n "$pvs_commit" ]; then
+  pvs_commit_cell="\`$pvs_commit\` of <https://github.com/SRI-CSL/PVS>"
+else
+  pvs_commit_cell="the tag \`$pvs_release\` of <https://github.com/SRI-CSL/PVS>"
+fi
+# The git repository of the download URL, for the clone command.
+nasalib_repo=$(echo "$nasalib_url" \
+  | sed -n 's|^https://raw.githubusercontent.com/\([^/]*\)/\([^/]*\).*|https://github.com/\1/\2|p')
+[ -n "$nasalib_repo" ] || nasalib_repo=https://github.com/nasa/pvslib
+incomplete=$(grep -c 'proved - incomplete' "$summary" || true)
+
+local_md="$tmp/local.md"
+{
+  echo "## Check the proofs with a local PVS"
+  echo
+  if [ -n "$libs" ]; then
+    echo "You need a local installation of PVS and NASALib. The container uses these"
+  else
+    echo "You need a local installation of PVS. The container uses this"
+  fi
+  if [ -n "$libs" ]; then echo "versions:"; else echo "version:"; fi
+  echo
+  echo "| Component | Version | Commit |"
+  echo "|---|---|---|"
+  echo "| PVS | release $pvs_version (tag \`$pvs_release\`, build \`$pvs_stamp\`) | $pvs_commit_cell |"
+  if [ -n "$libs" ]; then
+    if [ "$vendor" = yes ]; then
+      echo "| NASALib | the files in \`nasalib-dep\` | |"
+    else
+      echo "| NASALib | the commit of \`NASALIB_COMMIT\` in \`Containerfile\` | \`$nasalib_commit\` of <$nasalib_repo> |"
+    fi
+  fi
+  echo
+  echo "1. Install PVS $pvs_version, and make sure that \`proveit\` is in \`PATH\`."
+  if [ -n "$libs" ]; then
+    if [ "$vendor" = yes ]; then
+      echo "2. Get NASALib. Replace \`<nasalib>\` with the directory of NASALib. The"
+      echo "   directory \`nasalib-dep\` contains the NASALib files that the container"
+      echo "   uses. For the same result, use NASALib files that agree with them."
+      echo
+      echo "   \`\`\`sh"
+      echo "   git clone $nasalib_repo.git <nasalib>"
+      echo "   \`\`\`"
+    else
+      echo "2. Get NASALib at the commit of the table. Replace \`<nasalib>\` with the"
+      echo "   directory of NASALib:"
+      echo
+      echo "   \`\`\`sh"
+      echo "   git clone $nasalib_repo.git <nasalib>"
+      echo "   git -C <nasalib> checkout $nasalib_commit"
+      echo "   \`\`\`"
+    fi
+    echo
+    echo "3. Make sure that \`PVS_LIBRARY_PATH\` contains the directory of NASALib:"
+    echo
+    echo "   \`\`\`sh"
+    echo "   export PVS_LIBRARY_PATH=<nasalib>"
+    echo "   \`\`\`"
+    echo
+    step=4
+  else
+    step=2
+  fi
+  echo "$step. In the parent directory of this directory, run:"
+  echo
+  echo "   \`\`\`sh"
+  echo "   proveit $name"
+  echo "   \`\`\`"
+  echo
+  echo "\`proveit\` proves all theories that \`$name/top.pvs\` imports, and it"
+  echo "writes the summary to \`$name.summary\` in the parent directory."
+  if [ "$succeeded" -eq "$total" ] && [ "$total" -gt 0 ]; then
+    if [ "$total" -eq 1 ]; then
+      echo "The formula is reported as proved."
+    else
+      echo "All $total formulas are reported as proved."
+    fi
+  else
+    echo "Every formula must be reported as proved."
+  fi
+  if [ -n "$libs" ]; then
+    if [ "$incomplete" -gt 0 ]; then
+      if [ "$incomplete" -eq 1 ]; then
+        echo "1 formula uses NASALib lemmas, and it is reported as"
+      else
+        echo "$incomplete formulas use NASALib lemmas, and they are reported as"
+      fi
+      echo "\"proved - incomplete\", because \`proveit\` does not check the proofs of an"
+      echo "external library again."
+    else
+      echo "A formula that uses a NASALib lemma can be reported as \"proved -"
+      echo "incomplete\", because \`proveit\` does not check the proofs of an external"
+      echo "library again."
+    fi
+    echo "The container check proves the NASALib theories first, so there every"
+    echo "formula is \"proved - complete\"."
+  else
+    echo "Every formula must be \"proved - complete\"."
+  fi
+} > "$local_md"
+
 if [ ! -f "$stage/README.md" ]; then
   cat > "$stage/README.md" <<EOF
 # PVS development $name
 
 This directory contains a PVS development, and a container that checks
-every proof. The container installs PVS ${pvs_release#pvs}${libs:+ and the NASALib theories
+every proof. The container installs PVS $pvs_version${libs:+ and the NASALib theories
 that the development uses}, and it runs \`check-proofs.sh\`.
+
+## Check the proofs in a container
 
 You need Podman or Docker. In this directory, run:
 
@@ -781,7 +894,9 @@ a formula is not proved or a proof is not complete. To run the check again:
 podman run --rm localhost/$name
 docker run --rm $name
 \`\`\`
+
 EOF
+  cat "$local_md" >> "$stage/README.md"
 fi
 
 rm -f "$output"

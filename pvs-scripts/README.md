@@ -288,7 +288,7 @@ boxit [<option> ...] <dir>
    * `Containerfile`: installs a PVS release and the NASALib theories that the development uses, and runs the check.
    * `check-proofs.sh`: the check. `provethem` proves the NASALib theories, then `proveit` proves the development. Every formula must be "proved - complete".
    * `.containerignore`: the local PVS files that the container does not copy.
-   * `README.md`: the build and run commands, only if `<dir>` has no `README.md`.
+   * `README.md`: the commands to build and run the container, and the steps of a check with a local PVS and NASALib: a table with the PVS release and the PVS and NASALib commits that the container uses, `PVS_LIBRARY_PATH`, and `proveit <name>` in the parent directory. It also gives the number of formulas that `proveit` proves. `boxit` writes this file only if `<dir>` has no `README.md`.
 
 The zip file does not contain the files `<type>_adt.pvs` and `<type>_codt.pvs`, because PVS generates them from a `DATATYPE` or `CODATATYPE` declaration. It contains their proof files.
 
