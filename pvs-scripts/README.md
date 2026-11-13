@@ -6,6 +6,7 @@ The NASALib also provides a collection of scripts that automates several tasks.
 * [`provethem`](#provethem) - Runs `proveit` on several libraries 
 * [`pvsio`](#pvsio) - Command-line utility to run the PVSio ground evaluator.
 * [`prove-all`](#prove-all) - Runs `proveit` on each library in the NASALib by wrapping `provethem` in order to provide a specific kind of run. 
+* [`boxit`](#boxit) - Makes a zip file with a PVS development and a container (Podman or Docker) that checks every proof.
 * [`cleanbin-all`](#cleanbin-all) - Clean `.pvscontext` and binary files from PVS libraries.
 * [`find-all`](#find-all) - Searches strings matching a given regular expressions in PVS libraries.
 * [`dependencygraph`](#dependencygraph) - Generates a library dependency graph for libraries in the current directory.
@@ -266,6 +267,63 @@ To supersede this particular configuration, the same options accepted by `provet
 ```shell
 prove-all <options>
 ```
+
+# `boxit`
+
+Makes a zip file with a PVS development and a container that checks every proof.
+The container runs with Podman or Docker. Reviewers of a paper can use the zip file as an artifact.
+
+## Synopsis
+
+```shell
+boxit [<option> ...] <dir>
+```
+
+`<dir>` contains a PVS development with a file `top.pvs`. `boxit` does these steps:
+
+1. It runs `proveit -D` on a copy of `<dir>`. If `proveit` does not prove every formula, `boxit` stops with an error, unless you give `--force`.
+2. It reads the external dependencies in the dependency file that `proveit` writes. These are the NASALib theories that the development imports directly.
+3. It finds the NASALib theories that these theories import. For each library, it runs `proveit -T -D` on a copy of the library, with a top theory that imports the theories that the zip needs. It repeats this step until it finds no new theory. It ignores the libraries of the workspace `PVSPrelude`, because the PVS release contains them.
+4. It writes the zip file. The zip file contains the theories, the proofs, the files that match `--include` (default: `*.md`), and these generated files:
+   * `Containerfile`: installs a PVS release and the NASALib theories that the development uses, and runs the check.
+   * `check-proofs.sh`: the check. `provethem` proves the NASALib theories, then `proveit` proves the development. Every formula must be "proved - complete".
+   * `.containerignore`: the local PVS files that the container does not copy.
+   * `README.md`: the build and run commands, only if `<dir>` has no `README.md`.
+
+The zip file does not contain the files `<type>_adt.pvs` and `<type>_codt.pvs`, because PVS generates them from a `DATATYPE` or `CODATATYPE` declaration. It contains their proof files.
+
+By default, the container downloads the NASALib files from GitHub, at the commit of the local NASALib.
+If the local NASALib files do not agree with that commit, or the commit is not on a remote branch, `boxit` stops with an error.
+Give `--vendor` to put the NASALib files in the zip file instead.
+
+## Typical Usage
+
+```shell
+$ boxit --name mydev-pvs <dir>
+$ boxit --name mydev-pvs --container docker --test <dir>
+```
+
+The second command also builds the container from the zip file with Docker. The build runs the proof check.
+
+## Options
+
+| Option | Description |
+| --- | --- |
+|`-n \| --name <name>` | name of the zip top directory and the container image (default: the base name of `<dir>`, in lowercase) |
+|`-o \| --output <file.zip>` | output file (default: `<name>.zip`) |
+|[+] `-i \| --include <pattern>` | also put the files of `<dir>` that match `<pattern>` in the zip file (default: `*.md`) |
+|`--no-include` | clear the list of `--include` patterns |
+|`--nasalib <dir>` | the local NASALib (default: the directory of `PVS_LIBRARY_PATH` that contains the libraries) |
+|`--nasalib-commit <commit>` | the NASALib commit for the download (default: `HEAD` of the local NASALib) |
+|`--nasalib-url <url>` | the base URL for the download of raw NASALib files |
+|`--vendor` | put the NASALib files in the zip file |
+|`--pvs-release <tag>` | PVS release tag (default: `pvs8.1.3`) |
+|`--pvs-stamp <stamp>` | date stamp of the PVS release build (default: `20261028`) |
+|`--ubuntu <version>` | version of the Ubuntu base image (default: `24.04`) |
+|`-c \| --container <tool>` | the container application for `--test`: `podman` or `docker` (default: `podman` if it is in `PATH`, else `docker`) |
+|`-t \| --test` | build the container from the zip file with the container application |
+|`-f \| --force` | make the zip file even if `proveit` does not prove every formula, or the local NASALib files do not agree with the commit |
+|`-k \| --keep` | keep the temporary directory |
 
 # `cleanbin-all`
 

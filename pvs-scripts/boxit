@@ -1,0 +1,825 @@
+#!/bin/sh
+# boxit -- put a PVS development in a box: a zip file with a container
+# (Podman or Docker) that installs PVS and the NASALib theories that the
+# development uses, and checks every proof.
+#
+# Run "boxit --help" for the usage.
+#
+# The script works on macOS and Linux. It needs proveit (in PATH), git (for
+# the NASALib commit), and zip or python3 (for the zip file).
+
+set -eu
+
+prog=boxit
+
+usage() {
+  cat <<EOF
+NAME
+  $prog -- make a zip file with a container that checks a PVS development
+
+SYNOPSIS
+  $prog [<option> ...] <dir>
+
+DESCRIPTION
+  <dir> contains a PVS development with a file top.pvs. $prog does these
+  steps:
+
+  1. It copies the theories (*.pvs), the proofs (*.prf), and the extra
+     files (see --include) of <dir> to a temporary directory.
+  2. It runs "proveit -D" on the copy. proveit proves all theories that
+     top.pvs imports, and writes the dependency file.
+  3. It makes sure that proveit proves every formula. If one formula is not
+     proved, $prog stops with an error, unless you give --force. Formulas
+     that use NASALib lemmas can be "proved - incomplete" in this step.
+  4. It reads the external dependencies in the dependency file. These are
+     the NASALib theories that the development imports directly. For each
+     NASALib library, it runs "proveit -T -D" on a copy of the library to
+     find the theories that these theories import. It repeats this step
+     until it finds no new theory. It ignores the libraries of the workspace
+     PVSPrelude, because the PVS release contains them.
+  5. It writes the zip file. The zip has one top directory, <name>/, with
+     the files of step 1, and these generated files:
+       Containerfile     installs PVS and the NASALib theories, and runs
+                         the check
+       check-proofs.sh   the check: provethem proves the NASALib theories,
+                         then proveit proves the development. Every formula
+                         must be "proved - complete".
+       .containerignore  local PVS files that the container must not copy
+       README.md         the build and run commands (only if <dir> has no
+                         README.md)
+     If <dir> has a file Containerfile or check-proofs.sh, the zip contains
+     the generated file, not the file of <dir>. The zip does not contain
+     the files <type>_adt.pvs and <type>_codt.pvs, because PVS generates
+     them from a DATATYPE or CODATATYPE declaration. It contains their proof
+     files.
+
+  By default, the container downloads the NASALib files from GitHub, at the
+  commit of the local NASALib. The local NASALib files must agree with that
+  commit, and the commit must be on a remote branch. If not, give --vendor.
+  Then the zip contains the NASALib files.
+
+  The proof check in the container is the evaluation check. The local
+  check of step 2 does not prove the NASALib theories again.
+
+OPTIONS
+  -n, --name <name>         name of the zip top directory, the container
+                            image, and the directory of the development in
+                            the container (default: <dir base name>, in
+                            lowercase)
+  -o, --output <file.zip>   output file (default: <name>.zip in the current
+                            directory)
+  -i, --include <pattern>   also copy the files of <dir> that match the
+                            shell pattern <pattern> (cumulative, default:
+                            *.md)
+      --no-include          clear the list of --include patterns
+      --nasalib <dir>       the local NASALib (default: the directory of
+                            PVS_LIBRARY_PATH that contains the libraries)
+      --nasalib-commit <c>  the NASALib commit for the download (default:
+                            HEAD of the local NASALib)
+      --nasalib-url <url>   the base URL for the download of raw NASALib
+                            files (default: $nasalib_url_default)
+      --vendor              put the NASALib files in the zip, and do not
+                            download them in the container
+      --pvs-release <r>     PVS release tag (default: $pvs_release_default)
+      --pvs-stamp <s>       date stamp of the PVS release build (default:
+                            $pvs_stamp_default)
+      --ubuntu <version>    version of the Ubuntu base image (default:
+                            $ubuntu_default)
+  -c, --container <tool>    the container application for --test: podman
+                            or docker (default: podman if it is in PATH,
+                            else docker)
+  -t, --test                build the container from the zip file with the
+                            container application. The build runs the proof
+                            check.
+  -f, --force               make the zip file even if proveit does not prove
+                            every formula, or the local NASALib files do not
+                            agree with the commit
+  -k, --keep                keep the temporary directory
+  -h, --help                print this message
+
+EXAMPLES
+  $prog .
+  $prog --name tydoctor-pvs --container docker --test PVS
+EOF
+}
+
+nasalib_url_default=https://raw.githubusercontent.com/nasa/pvslib
+pvs_release_default=pvs8.1.3
+pvs_stamp_default=20261028
+ubuntu_default=24.04
+
+name=
+output=
+includes='*.md'
+nasalib=
+nasalib_commit=
+nasalib_url=$nasalib_url_default
+vendor=no
+pvs_release=$pvs_release_default
+pvs_stamp=$pvs_stamp_default
+ubuntu=$ubuntu_default
+container=
+test=no
+force=no
+keep=no
+
+die() {
+  echo "$prog: error: $*" >&2
+  exit 1
+}
+
+warn() {
+  echo "$prog: warning: $*" >&2
+}
+
+info() {
+  echo "$prog: $*"
+}
+
+need_arg() {
+  if [ $# -lt 2 ] || [ -z "$2" ]; then
+    die "option $1 needs an argument"
+  fi
+}
+
+dir=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--name) need_arg "$@"; name=$2; shift 2 ;;
+    -o|--output) need_arg "$@"; output=$2; shift 2 ;;
+    -i|--include) need_arg "$@"; includes="$includes
+$2"; shift 2 ;;
+    --no-include) includes=; shift ;;
+    --nasalib) need_arg "$@"; nasalib=$2; shift 2 ;;
+    --nasalib-commit) need_arg "$@"; nasalib_commit=$2; shift 2 ;;
+    --nasalib-url) need_arg "$@"; nasalib_url=$2; shift 2 ;;
+    --vendor) vendor=yes; shift ;;
+    --pvs-release) need_arg "$@"; pvs_release=$2; shift 2 ;;
+    --pvs-stamp) need_arg "$@"; pvs_stamp=$2; shift 2 ;;
+    --ubuntu) need_arg "$@"; ubuntu=$2; shift 2 ;;
+    -c|--container) need_arg "$@"; container=$2; shift 2 ;;
+    -t|--test) test=yes; shift ;;
+    -f|--force) force=yes; shift ;;
+    -k|--keep) keep=yes; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown option $1 (see $prog --help)" ;;
+    *)
+      if [ -n "$dir" ]; then
+        die "give only one directory (see $prog --help)"
+      fi
+      dir=$1; shift ;;
+  esac
+done
+if [ $# -gt 0 ]; then
+  if [ -n "$dir" ] || [ $# -gt 1 ]; then
+    die "give only one directory (see $prog --help)"
+  fi
+  dir=$1
+fi
+[ -n "$dir" ] || { usage >&2; exit 1; }
+
+case "$container" in
+  podman|docker) ;;
+  '')
+    if command -v podman >/dev/null 2>&1; then
+      container=podman
+    else
+      container=docker
+    fi ;;
+  *) die "--container accepts podman or docker, not $container" ;;
+esac
+if [ "$test" = yes ]; then
+  command -v "$container" >/dev/null 2>&1 || die "$container is not in PATH"
+fi
+
+[ -d "$dir" ] || die "$dir is not a directory"
+dir=$(cd "$dir" && pwd)
+[ -f "$dir/top.pvs" ] || die "$dir has no top.pvs"
+command -v proveit >/dev/null 2>&1 || die "proveit is not in PATH"
+
+if [ -z "$name" ]; then
+  name=$(basename "$dir" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')
+fi
+case "$name" in
+  *[!a-z0-9._-]*|[!a-z0-9]*)
+    die "the name \"$name\" is not a valid image name. Use --name with lowercase letters, digits, '.', '_', and '-'." ;;
+esac
+[ -n "$output" ] || output="$name.zip"
+case "$output" in
+  /*) ;;
+  *) output="$(pwd)/$output" ;;
+esac
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/boxit.XXXXXX")
+cleanup() {
+  if [ "$keep" = yes ]; then
+    info "temporary directory: $tmp"
+  else
+    rm -rf "$tmp"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+# ---------------------------------------------------------------------------
+# 1. Copy the development.
+
+# The zip directory gets the files of <dir>. proveit runs on a second copy,
+# because proveit can change the files (for example, it purges proofs).
+stage="$tmp/stage/$name"
+prove="$tmp/prove/$name"
+mkdir -p "$stage" "$tmp/prove"
+copy_files() { # copy_files <pattern>: copy the files of $dir that match
+  for f in "$dir"/$1; do
+    [ -f "$f" ] || continue
+    b=$(basename "$f")
+    case "$b" in
+      orphaned-proofs.prf|Containerfile|check-proofs.sh|.containerignore) continue ;;
+      # PVS generates these files from a DATATYPE or CODATATYPE declaration.
+      # Their proof files are not generated, so *.prf copies them.
+      *_adt.pvs|*_codt.pvs|*_coadt.pvs) continue ;;
+    esac
+    cp "$f" "$stage/$b"
+  done
+}
+copy_files '*.pvs'
+copy_files '*.prf'
+# Split the patterns at newlines, and do not expand them here.
+old_ifs=$IFS
+IFS='
+'
+set -f
+for p in $includes; do
+  set +f
+  copy_files "$p"
+done
+set +f
+IFS=$old_ifs
+cp -R "$stage" "$prove"
+for f in Containerfile check-proofs.sh; do
+  if [ -f "$dir/$f" ]; then
+    warn "$dir/$f is not copied. The zip contains a generated $f."
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# 2. Prove the development, and compute the dependencies.
+
+# PVS can rewrite the proof files of a library when it typechecks the
+# library for the first time. Thus, before proveit runs, record the changed
+# files of each git repository in PVS_LIBRARY_PATH (and --nasalib). Step 4
+# uses this record to find the changes that this run made.
+snap="$tmp/snap"
+mkdir -p "$snap"
+repo_key() { # repo_key <dir>: print a key for the git repository of <dir>
+  top=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) || return 1
+  echo "$top" | cksum | cut -d' ' -f1
+}
+old_ifs=$IFS
+IFS=:
+for d in ${PVS_LIBRARY_PATH:-} $nasalib; do
+  IFS=$old_ifs
+  [ -d "$d" ] || continue
+  key=$(repo_key "$d") || continue
+  [ -f "$snap/$key" ] && continue
+  git -C "$d" status --porcelain --untracked-files=all 2>/dev/null \
+    | sed 's/^...//' > "$snap/$key"
+done
+IFS=$old_ifs
+
+info "proving $dir with proveit (this can take some minutes)"
+proveit -D "$prove" > "$tmp/proveit.log" 2>&1 || true
+summary="$tmp/prove/$name.summary"
+depfile="$tmp/prove/$name.dep"
+if [ ! -f "$summary" ] || [ ! -f "$depfile" ]; then
+  echo "proveit wrote no summary or no dependency file. The end of its log:" >&2
+  tail -n 40 "$tmp/proveit.log" >&2
+  die "proveit failed on $dir"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Make sure that every formula is proved.
+
+totals=$(grep 'Grand Totals' "$summary" || true)
+[ -n "$totals" ] || die "the summary of proveit has no Grand Totals line"
+total=$(echo "$totals" | sed 's/.*Grand Totals: \([0-9]*\) proofs.*/\1/')
+attempted=$(echo "$totals" | sed 's/.* \([0-9]*\) attempted.*/\1/')
+succeeded=$(echo "$totals" | sed 's/.* \([0-9]*\) succeeded.*/\1/')
+info "proveit: $total formulas, $attempted attempted, $succeeded succeeded"
+if [ "$total" -eq 0 ] || [ "$attempted" -ne "$total" ] \
+   || [ "$succeeded" -ne "$total" ]; then
+  grep -E 'untried|unfinished' "$summary" >&2 || true
+  if [ "$force" = yes ]; then
+    warn "proveit did not prove every formula ($totals). --force is set, so the zip is made."
+  else
+    die "proveit did not prove every formula ($totals). Give --force to make the zip file."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Find the NASALib theories that the development uses.
+#    The section "External workspace dependencies" of a dependency file
+#    lists the external theories that the local theories import directly.
+#    A line has the form [<workspace>]<root>/<lib>:<th1>,...,<thn>
+#    These theories can import more theories, in the same library or in
+#    other libraries. To find them, $prog runs "proveit -T -D" on a copy of
+#    each library, with a top theory that imports the theories that the zip
+#    needs. The section "Local dependencies" of that dependency file gives
+#    the theories of the library, and the section "External workspace
+#    dependencies" gives more libraries. $prog repeats this step until it
+#    finds no new theory.
+
+# Print the external theories of a dependency file as <lib>:<theory>, one
+# for each line. Ignore the libraries of PVSPrelude. Print
+# ERROR <workspace> <path> for a library of another workspace.
+externals_of() { # externals_of <depfile>
+  sed -n '/^# External workspace dependencies/,/^# /p' "$1" \
+    | grep -v '^#' | grep -v '^ *$' \
+    | while read -r line; do
+        ws=$(echo "$line" | sed -n 's/^\[\([^]]*\)\].*/\1/p')
+        path=$(echo "$line" | sed 's/^\[[^]]*\]//; s/:.*//')
+        lib=${path#*/}
+        # The PVS release contains the libraries of the workspace
+        # PVSPrelude (for example, lib/finite_sets).
+        [ "$ws" = PVSPrelude ] && continue
+        if [ "$ws" != NASALib ] || [ "$lib" = "$path" ]; then
+          echo "ERROR $ws $path"
+          continue
+        fi
+        for th in $(echo "$line" | sed 's/^[^:]*://' | tr ',' ' '); do
+          echo "$lib:$th"
+        done
+      done
+}
+
+# Print the theories in the section "Local dependencies" of a dependency
+# file, except the top theory.
+locals_of() { # locals_of <depfile>
+  awk 'f { print; exit } /^# Local dependencies/ { f = 1 }' "$1" \
+    | sed 's/^[^:]*: *//' | tr ',' '\n' | grep -v '^ *$' | grep -v '^top$' || true
+}
+
+# Exit with an error if a list of externals_of has an ERROR line.
+check_externals() { # check_externals <list>
+  bad=$(echo "$1" | grep '^ERROR ' | head -n 1 || true)
+  if [ -n "$bad" ]; then
+    set -- $bad
+    die "the development uses the library ${3:-?} of the workspace ${2:-?}. $prog supports only NASALib."
+  fi
+}
+
+# Print the files of the library directory <libdir> that the zip needs for
+# <theory>, one for each line, relative to <libdir>.
+# PVS generates the theories <type>_adt, <type>_adt_map, ... of a DATATYPE
+# (and <type>_codt, ... of a CODATATYPE) in the file <type>_adt.pvs (or
+# <type>_codt.pvs). The zip does not need that file, because PVS generates
+# it again from the file that declares <type>. The zip needs the proofs of
+# the generated file, <type>_adt.prf.
+theory_files() { # theory_files <libdir> <theory>
+  th=$2
+  gen=$(echo "$th" | sed -n -E 's/^(.+)_(adt|codt|coadt)(_[a-z]+)?$/\1_\2/p')
+  if [ -n "$gen" ]; then
+    name=${gen%_*}
+  else
+    name=$th
+  fi
+  decl=
+  if [ -f "$1/$name.pvs" ] \
+     && grep -q -i -E "^[[:space:]]*$name[[:space:]]*(\[|:[[:space:]]*(THEORY|DATATYPE|CODATATYPE)|$)" "$1/$name.pvs"; then
+    decl=$name
+  else
+    for f in "$1"/*.pvs; do
+      [ -f "$f" ] || continue
+      case "$f" in *_adt.pvs|*_codt.pvs|*_coadt.pvs) continue ;; esac
+      if grep -q -i -E "^[[:space:]]*$name[[:space:]]*(\[|:[[:space:]]*(THEORY|DATATYPE|CODATATYPE)|$)" "$f"; then
+        decl=$(basename "$f" .pvs); break
+      fi
+    done
+  fi
+  [ -n "$decl" ] || return 1
+  echo "$decl.pvs"
+  [ -f "$1/$decl.prf" ] && echo "$decl.prf"
+  if [ -n "$gen" ] && [ -f "$1/$gen.prf" ]; then
+    echo "$gen.prf"
+  fi
+  return 0
+}
+
+needed=        # the theories that the zip needs, as <lib>:<theory>
+libs=          # the NASALib libraries, in the order that $prog finds them
+dirty=         # the libraries with theories that $prog did not examine
+# add_theory <lib>:<theory>: add the theory to $needed, and mark its
+# library as dirty when the theory is new.
+add_theory() {
+  case "
+$needed
+" in
+    *"
+$1
+"*) return 0 ;;
+  esac
+  needed="${needed:+$needed
+}$1"
+  l=${1%%:*}
+  case " $libs " in *" $l "*) ;; *) libs="${libs:+$libs }$l" ;; esac
+  case " $dirty " in *" $l "*) ;; *) dirty="${dirty:+$dirty }$l" ;; esac
+}
+
+ext=$(externals_of "$depfile")
+check_externals "$ext"
+for x in $ext; do add_theory "$x"; done
+
+nasalib_files=
+if [ -n "$libs" ]; then
+  if [ -z "$nasalib" ]; then
+    first=${libs%% *}
+    old_ifs=$IFS
+    IFS=:
+    for d in ${PVS_LIBRARY_PATH:-}; do
+      d=${d%/}
+      if [ -n "$d" ] && [ -d "$d/$first" ]; then
+        nasalib=$d; break
+      fi
+    done
+    IFS=$old_ifs
+    [ -n "$nasalib" ] || die "NASALib is not in PVS_LIBRARY_PATH. Use --nasalib."
+  fi
+  nasalib=$(cd "$nasalib" && pwd)
+
+  # Find the theories that the NASALib theories import.
+  n=0
+  while [ -n "$dirty" ]; do
+    lib=${dirty%% *}
+    if [ "$lib" = "$dirty" ]; then dirty=; else dirty=${dirty#* }; fi
+    [ -d "$nasalib/$lib" ] || die "the library $lib is not in $nasalib"
+    n=$((n + 1))
+    copy="$tmp/libs/$n/$(basename "$lib")"
+    mkdir -p "$tmp/libs/$n"
+    cp -R "$nasalib/$lib" "$copy"
+    rm -rf "$copy/pvsbin" "$copy/.pvscontext"
+    ths=$(echo "$needed" | sed -n "s|^$lib:||p" | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+    printf 'top: THEORY\nBEGIN\n  IMPORTING %s\nEND top\n' "$ths" > "$copy/top.pvs"
+    info "finding the dependencies of $lib: $ths"
+    proveit -T -D "$copy" > "$tmp/libs/$n/proveit.log" 2>&1 || true
+    libdep="$copy.dep"
+    if [ ! -f "$libdep" ]; then
+      tail -n 40 "$tmp/libs/$n/proveit.log" >&2
+      die "proveit wrote no dependency file for the NASALib library $lib"
+    fi
+    for th in $(locals_of "$libdep"); do
+      # These theories are in the closure of the library already, so they
+      # do not make the library dirty again.
+      case "
+$needed
+" in
+        *"
+$lib:$th
+"*) ;;
+        *) needed="$needed
+$lib:$th" ;;
+      esac
+    done
+    ext=$(externals_of "$libdep")
+    check_externals "$ext"
+    for x in $ext; do add_theory "$x"; done
+  done
+
+  # The files of the theories.
+  for x in $needed; do
+    lib=${x%%:*}
+    th=${x#*:}
+    files=$(theory_files "$nasalib/$lib" "$th") \
+      || die "no file of $nasalib/$lib declares the theory $th"
+    for f in $files; do
+      case "
+$nasalib_files
+" in
+        *"
+$lib/$f
+"*) ;;
+        *) nasalib_files="${nasalib_files:+$nasalib_files
+}$lib/$f" ;;
+      esac
+    done
+  done
+
+  # provethem proves the libraries in the order of all-libraries. A library
+  # that $prog finds later is a dependency of a library that it finds
+  # earlier, so put the libraries in the reverse order.
+  rev=
+  for lib in $libs; do rev="$lib${rev:+ $rev}"; done
+  libs=$rev
+  info "NASALib libraries: $libs"
+  info "NASALib files: $(echo "$nasalib_files" | tr '\n' ' ')"
+
+  # The commit of the download.
+  if [ "$vendor" = no ]; then
+    if [ -z "$nasalib_commit" ]; then
+      nasalib_commit=$(git -C "$nasalib" rev-parse HEAD 2>/dev/null) \
+        || die "$nasalib is not a git repository. Give --nasalib-commit or --vendor."
+    fi
+    problem=
+    if git -C "$nasalib" rev-parse -q --verify "$nasalib_commit^{commit}" >/dev/null 2>&1; then
+      nasalib_commit=$(git -C "$nasalib" rev-parse "$nasalib_commit^{commit}")
+      # shellcheck disable=SC2086
+      changed=$(cd "$nasalib" && git diff --name-only --relative "$nasalib_commit" -- $nasalib_files 2>/dev/null; \
+                git ls-files --others -- $nasalib_files 2>/dev/null)
+      # Separate the changes that this run made (see step 2). For these
+      # files, the committed version is the version that the user has.
+      key=$(repo_key "$nasalib") || key=none
+      prefix=$(git -C "$nasalib" rev-parse --show-prefix 2>/dev/null || true)
+      by_run=
+      before=
+      for f in $changed; do
+        if [ -f "$snap/$key" ] && ! grep -q -x -F "$prefix$f" "$snap/$key" \
+           && [ -z "$(git -C "$nasalib" diff --name-only --relative "$nasalib_commit" HEAD -- "$f" 2>/dev/null)" ]; then
+          by_run="$by_run $f"
+        else
+          before="$before $f"
+        fi
+      done
+      changed=$before
+      if [ -n "$by_run" ]; then
+        warn "PVS changed these NASALib files during this run:$by_run. The zip uses the committed version. To restore the files, run: git -C $nasalib checkout --$by_run"
+      fi
+      if [ -n "$changed" ]; then
+        problem="these local NASALib files do not agree with the commit $nasalib_commit:$changed"
+      elif [ -z "$(git -C "$nasalib" branch -r --contains "$nasalib_commit" 2>/dev/null)" ]; then
+        problem="the NASALib commit $nasalib_commit is not on a remote branch, so the download can fail"
+      fi
+    else
+      problem="the local NASALib does not have the commit $nasalib_commit, so $prog cannot compare the files"
+    fi
+    if [ -n "$problem" ]; then
+      if [ "$force" = yes ]; then
+        warn "$problem. --force is set, so the zip is made."
+      else
+        die "$problem. Give --vendor to put the local files in the zip, or --force."
+      fi
+    fi
+    info "NASALib commit: $nasalib_commit"
+  fi
+else
+  info "the development uses no NASALib theory"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Write the zip file.
+
+if [ "$vendor" = yes ] && [ -n "$libs" ]; then
+  for f in $nasalib_files; do
+    mkdir -p "$stage/nasalib-dep/$(dirname "$f")"
+    cp "$nasalib/$f" "$stage/nasalib-dep/$f"
+  done
+fi
+
+# The lines of the Containerfile that make /work/nasalib-dep.
+nasalib_layout=
+if [ -n "$libs" ]; then
+  tops=
+  for lib in $libs; do
+    ths=
+    for lt in $needed; do
+      case "$lt" in
+        "$lib":*) ths="${ths:+$ths, }${lt#"$lib":}" ;;
+      esac
+    done
+    tops="$tops \\
+ && printf 'top: THEORY\\nBEGIN\\n  IMPORTING $ths\\nEND top\\n' \\
+      > /work/nasalib-dep/$lib/top.pvs"
+  done
+  all_libs=$(echo "$libs" | tr ' ' '\n' | sed 's/$/\\n/' | tr -d '\n')
+  if [ "$vendor" = yes ]; then
+    nasalib_layout="# The NASALib theories that the development uses.
+COPY nasalib-dep/ /work/nasalib-dep/
+RUN true$tops \\
+ && printf '$all_libs' > /work/nasalib-dep/all-libraries"
+  else
+    dirs=
+    for lib in $libs; do dirs="$dirs /work/nasalib-dep/$lib"; done
+    nasalib_layout="# The NASALib theories that the development uses, at a fixed commit.
+RUN base=\"$nasalib_url/\${NASALIB_COMMIT}\" \\
+ && mkdir -p$dirs \\
+ && for f in $(echo "$nasalib_files" | tr '\n' ' ' | sed 's/ $//'); do \\
+      curl -fsSL -o \"/work/nasalib-dep/\$f\" \"\$base/\$f\" || exit 1; \\
+    done$tops \\
+ && printf '$all_libs' > /work/nasalib-dep/all-libraries"
+  fi
+fi
+
+# The COPY line of the development: one pattern for each kind of file in the
+# zip, because COPY fails on a pattern that matches no file.
+patterns='*.pvs'
+ls "$stage"/*.prf >/dev/null 2>&1 && patterns="$patterns *.prf"
+old_ifs=$IFS
+IFS='
+'
+set -f
+for p in $includes; do
+  set +f
+  case " $patterns " in *" $p "*) continue ;; esac
+  for f in "$stage"/$p; do
+    if [ -f "$f" ]; then patterns="$patterns $p"; break; fi
+  done
+done
+set +f
+IFS=$old_ifs
+
+if [ -n "$libs" ]; then
+  layout_comment="#   /work/nasalib-dep/      the NASALib theories that the development uses
+#     all-libraries         the libraries for provethem: $libs
+"
+  for lib in $libs; do
+    layout_comment="$layout_comment#     $lib/  $(echo "$nasalib_files" | grep "^$lib/.*\.pvs$" | sed "s|^$lib/||; s|\.pvs$||" | tr '\n' ' ')and a top theory
+"
+  done
+else
+  layout_comment=
+fi
+
+if [ "$vendor" = no ] && [ -n "$libs" ]; then
+  commit_arg="ARG NASALIB_COMMIT=$nasalib_commit
+"
+else
+  commit_arg=
+fi
+
+cat > "$stage/Containerfile" <<EOF
+# Check the PVS development $name with PVS ${pvs_release#pvs}.
+# This file was generated by $prog.
+#
+# Layout in the image:
+$layout_comment#   /work/$name/   the development
+#   /work/check-proofs.sh   the proof check
+#
+# Build (from this directory):
+#   podman build -t $name .
+#   docker build -f Containerfile -t $name .
+# The build runs the proof check, and it fails when a formula is not proved.
+# Run the check again:
+#   podman run --rm localhost/$name
+#   docker run --rm $name
+
+FROM docker.io/library/ubuntu:$ubuntu
+
+ARG PVS_RELEASE=$pvs_release
+ARG PVS_STAMP=$pvs_stamp
+$commit_arg
+RUN apt-get update \\
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\
+      ca-certificates curl perl \\
+ && rm -rf /var/lib/apt/lists/*
+
+# PVS: the release build for the architecture of the host.
+RUN arch="\$(uname -m)" \\
+ && case "\$arch" in \\
+      x86_64) pvsarch=x86_64 ;; \\
+      aarch64|arm64) pvsarch=aarch64 ;; \\
+      *) echo "unsupported architecture: \$arch" >&2; exit 1 ;; \\
+    esac \\
+ && curl -fsSL -o /tmp/pvs.tgz \\
+      "https://github.com/SRI-CSL/PVS/releases/download/\${PVS_RELEASE}/\${PVS_RELEASE}-\${PVS_STAMP}-linux-\${pvsarch}.tgz" \\
+ && mkdir -p /opt/pvs \\
+ && tar -xzf /tmp/pvs.tgz -C /opt/pvs \\
+ && rm /tmp/pvs.tgz \\
+ && ln -s "\$(dirname "\$(find /opt/pvs -maxdepth 2 -name proveit -type f | head -n 1)")" /opt/pvs-bin
+
+ENV PATH=/opt/pvs-bin:\$PATH
+
+$nasalib_layout
+
+# The development.
+COPY $patterns /work/$name/
+COPY check-proofs.sh /work/check-proofs.sh
+
+WORKDIR /work
+RUN sh /work/check-proofs.sh
+
+CMD ["sh", "/work/check-proofs.sh"]
+EOF
+
+if [ -n "$libs" ]; then
+  nasalib_check="cd \"\$work/nasalib-dep\"
+PVS_LIBRARY_PATH=\"\$work/nasalib-dep\"
+export PVS_LIBRARY_PATH
+
+provethem -f > provethem.log 2>&1 || true
+grep -v '^ *\$' provethem.log | tail -n 4
+if ! grep -q 'Missed: 0 formulas' provethem.log; then
+  echo \"FAILED: provethem did not prove every NASALib formula.\" >&2
+  exit 1
+fi
+
+proveit --clear-path --add-path \".\" ../$name > proveit.log 2>&1 || true"
+  steps="# 1. In nasalib-dep, provethem proves the libraries in all-libraries.
+# 2. proveit proves the development in $name, with nasalib-dep as the only
+#    library directory."
+else
+  nasalib_check="cd \"\$work\"
+proveit --clear-path $name > proveit.log 2>&1 || true"
+  steps="# proveit proves the development in $name."
+fi
+
+cat > "$stage/check-proofs.sh" <<EOF
+#!/bin/sh
+# usage: check-proofs.sh [WORKDIR]
+# This file was generated by $prog.
+# WORKDIR (default /work) contains $name/${libs:+ and nasalib-dep/}.
+$steps
+# Exit with status 1 unless every formula is proved, and every proof of
+# the development is complete.
+set -eu
+work=\${1:-/work}
+$nasalib_check
+summary="\$work/$name.summary"
+if [ ! -f "\$summary" ]; then
+  echo "proveit wrote no summary. The end of its log:" >&2
+  tail -n 40 proveit.log >&2
+  exit 1
+fi
+cat "\$summary"
+totals=\$(grep 'Grand Totals' "\$summary")
+total=\$(echo "\$totals" | sed 's/.*Grand Totals: \([0-9]*\) proofs.*/\1/')
+attempted=\$(echo "\$totals" | sed 's/.* \([0-9]*\) attempted.*/\1/')
+succeeded=\$(echo "\$totals" | sed 's/.* \([0-9]*\) succeeded.*/\1/')
+incomplete=\$(grep -c 'proved - incomplete' "\$summary" || true)
+if [ "\$total" -eq 0 ] || [ "\$attempted" -ne "\$total" ] || [ "\$succeeded" -ne "\$total" ] \\
+   || [ "\$incomplete" -ne 0 ]; then
+  echo "FAILED: \$totals, \$incomplete proved - incomplete" >&2
+  exit 1
+fi
+echo "OK: all \$total formulas of $name proved and complete."
+EOF
+
+printf 'orphaned-proofs.prf\npvsbin\n.pvscontext\n' > "$stage/.containerignore"
+
+if [ ! -f "$stage/README.md" ]; then
+  cat > "$stage/README.md" <<EOF
+# PVS development $name
+
+This directory contains a PVS development, and a container that checks
+every proof. The container installs PVS ${pvs_release#pvs}${libs:+ and the NASALib theories
+that the development uses}, and it runs \`check-proofs.sh\`.
+
+You need Podman or Docker. In this directory, run:
+
+\`\`\`sh
+podman build -t $name .
+\`\`\`
+
+With Docker:
+
+\`\`\`sh
+docker build -f Containerfile -t $name .
+\`\`\`
+
+The build needs network access. The build runs the check, and it fails if
+a formula is not proved or a proof is not complete. To run the check again:
+
+\`\`\`sh
+podman run --rm localhost/$name
+docker run --rm $name
+\`\`\`
+EOF
+fi
+
+rm -f "$output"
+if command -v zip >/dev/null 2>&1; then
+  (cd "$tmp/stage" && zip -q -r -X "$output" "$name")
+elif command -v python3 >/dev/null 2>&1; then
+  python3 -I - "$tmp/stage" "$name" "$output" <<'EOF'
+import os, sys, zipfile
+root, name, out = sys.argv[1], sys.argv[2], sys.argv[3]
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    for d, subdirs, files in os.walk(os.path.join(root, name)):
+        subdirs.sort()
+        for f in sorted(files):
+            p = os.path.join(d, f)
+            z.write(p, os.path.relpath(p, root))
+EOF
+else
+  die "zip and python3 are not available, so $prog cannot write the zip file"
+fi
+count=$(cd "$tmp/stage" && find "$name" -type f | wc -l | tr -d ' ')
+info "wrote $output ($count files)"
+
+# ---------------------------------------------------------------------------
+# 6. Optional test: build the container from the zip file.
+
+if [ "$test" = yes ]; then
+  mkdir -p "$tmp/test"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q "$output" -d "$tmp/test"
+  else
+    python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+      "$output" "$tmp/test"
+  fi
+  info "building the container with $container (this runs the proof check)"
+  if [ "$container" = docker ]; then
+    (cd "$tmp/test/$name" && docker build --progress=plain -f Containerfile -t "$name" .)
+  else
+    (cd "$tmp/test/$name" && podman build -f Containerfile -t "$name" .)
+  fi
+  info "the container check passed"
+fi
